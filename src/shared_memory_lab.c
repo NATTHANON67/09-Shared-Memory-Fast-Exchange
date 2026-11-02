@@ -1,3 +1,6 @@
+
+#define _DEFAULT_SOURCE
+
 #include "shared_memory_lab.h"
 
 #include <stdio.h>
@@ -9,24 +12,35 @@
 #include <unistd.h>
 
 int create_segment(void) {
-    return shmget(IPC_PRIVATE, sizeof(struct shared_block), 0600 | IPC_CREAT);
+    return shmget(IPC_PRIVATE, sizeof(struct shared_block),
+                  0600 | IPC_CREAT);
 }
 
 void cleanup_segment(int segment_id, struct shared_block *block) {
     if (shmdt(block) == -1) {
         perror("shmdt");
     }
+
     if (shmctl(segment_id, IPC_RMID, NULL) == -1) {
         perror("shmctl");
     }
 }
 
-static void wait_for_ready(const struct shared_block *block) {
-    while (!block->ready) {
+/* Wait until shared memory reaches a particular state. */
+static void wait_for_state(const struct shared_block *block, int state) {
+    const volatile int *ready = &block->ready;
+
+    while (*ready != state) {
         usleep(1000);
     }
 }
 
+static void wait_for_ready(const struct shared_block *block) {
+    wait_for_state(block, 1);
+}
+
+
+/* TASK A: Fast exchange using shared memory. */
 int task_fast_exchange(void) {
     int segment_id;
     pid_t child_pid;
@@ -34,19 +48,24 @@ int task_fast_exchange(void) {
     struct shared_block *block;
 
     segment_id = create_segment();
+
     if (segment_id == -1) {
         perror("shmget");
         return 1;
     }
 
     block = shmat(segment_id, NULL, 0);
+
     if (block == (void *)-1) {
         perror("shmat");
+        shmctl(segment_id, IPC_RMID, NULL);
         return 1;
     }
+
     memset(block, 0, sizeof(*block));
 
     child_pid = fork();
+
     if (child_pid < 0) {
         perror("fork");
         cleanup_segment(segment_id, block);
@@ -54,15 +73,48 @@ int task_fast_exchange(void) {
     }
 
     if (child_pid == 0) {
-        /* TODO: wait until parent marks block->ready. */
-        /* TODO: print: child fast read: shared memory is fast */
-        /* TODO: detach shared memory and return 0 on success. */
-        fprintf(stderr, "TODO: task_fast_exchange child path not implemented\n");
-        return 1;
+        char received[32];
+
+        /* Receive the first part. */
+        wait_for_state(block, 1);
+
+        snprintf(received, sizeof(received), "%s",
+                 block->message);
+
+        /* Tell parent the first part has been read. */
+        block->ready = 2;
+
+        /* Receive the second part. */
+        wait_for_state(block, 3);
+
+        strncat(received, block->message,
+                sizeof(received) - strlen(received) - 1);
+
+        printf("child fast read: %s\n", received);
+        fflush(stdout);
+
+        if (shmdt(block) == -1) {
+            perror("shmdt");
+            _exit(1);
+        }
+
+        _exit(0);
     }
 
-    /* TODO: copy "shared memory is fast" into block->message. */
-    /* TODO: set block->ready = 1 so child can read it. */
+    /* First part of the message. */
+    snprintf(block->message, sizeof(block->message),
+             "%s", "shared memory ");
+
+    block->ready = 1;
+
+    /* Wait until child has copied the first part. */
+    wait_for_state(block, 2);
+
+    /* Second part of the message. */
+    snprintf(block->message, sizeof(block->message),
+             "%s", "is fast");
+
+    block->ready = 3;
 
     if (waitpid(child_pid, &status, 0) == -1) {
         perror("waitpid");
@@ -71,9 +123,12 @@ int task_fast_exchange(void) {
     }
 
     cleanup_segment(segment_id, block);
+
     return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 1;
 }
 
+
+/* TASK B: Shared memory only keeps the latest value. */
 int task_latest_value_limit(void) {
     int segment_id;
     pid_t child_pid;
@@ -81,19 +136,24 @@ int task_latest_value_limit(void) {
     struct shared_block *block;
 
     segment_id = create_segment();
+
     if (segment_id == -1) {
         perror("shmget");
         return 1;
     }
 
     block = shmat(segment_id, NULL, 0);
+
     if (block == (void *)-1) {
         perror("shmat");
+        shmctl(segment_id, IPC_RMID, NULL);
         return 1;
     }
+
     memset(block, 0, sizeof(*block));
 
     child_pid = fork();
+
     if (child_pid < 0) {
         perror("fork");
         cleanup_segment(segment_id, block);
@@ -101,15 +161,28 @@ int task_latest_value_limit(void) {
     }
 
     if (child_pid == 0) {
-        /* TODO: wait until parent sets ready. */
-        /* TODO: print: child latest view: latest-only */
-        /* TODO: detach and return 0 on success. */
-        fprintf(stderr, "TODO: task_latest_value_limit child path not implemented\n");
-        return 1;
+        wait_for_ready(block);
+
+        printf("child latest view: %s\n", block->message);
+        fflush(stdout);
+
+        if (shmdt(block) == -1) {
+            perror("shmdt");
+            _exit(1);
+        }
+
+        _exit(0);
     }
 
-    /* TODO: parent writes "first update" then "latest-only" to block->message. */
-    /* TODO: set ready and let child read only the latest value. */
+    /* First update. */
+    snprintf(block->message, sizeof(block->message),
+             "%s", "first update");
+
+    /* Overwrite it with the latest update. */
+    snprintf(block->message, sizeof(block->message),
+             "%s", "latest-only");
+
+    block->ready = 1;
 
     if (waitpid(child_pid, &status, 0) == -1) {
         perror("waitpid");
@@ -118,30 +191,39 @@ int task_latest_value_limit(void) {
     }
 
     cleanup_segment(segment_id, block);
+
     return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 1;
 }
 
+
+/* TASK C: Demonstrate fixed buffer capacity. */
 int task_capacity_limit(void) {
     int segment_id;
     pid_t child_pid;
     int status;
     struct shared_block *block;
+
     const char *source = "abcdefghijklmnopqrstuvwxyz";
 
     segment_id = create_segment();
+
     if (segment_id == -1) {
         perror("shmget");
         return 1;
     }
 
     block = shmat(segment_id, NULL, 0);
+
     if (block == (void *)-1) {
         perror("shmat");
+        shmctl(segment_id, IPC_RMID, NULL);
         return 1;
     }
+
     memset(block, 0, sizeof(*block));
 
     child_pid = fork();
+
     if (child_pid < 0) {
         perror("fork");
         cleanup_segment(segment_id, block);
@@ -149,16 +231,25 @@ int task_capacity_limit(void) {
     }
 
     if (child_pid == 0) {
-        /* TODO: wait for ready flag. */
-        /* TODO: print: child capacity bytes: 15 */
-        /* TODO: detach and return 0 on success. */
-        fprintf(stderr, "TODO: task_capacity_limit child path not implemented\n");
-        return 1;
+        wait_for_ready(block);
+
+        printf("child capacity bytes: %zu\n",
+               strlen(block->message));
+        fflush(stdout);
+
+        if (shmdt(block) == -1) {
+            perror("shmdt");
+            _exit(1);
+        }
+
+        _exit(0);
     }
 
-    (void)source;
-    /* TODO: copy source into block->message safely with snprintf. */
-    /* TODO: set ready, wait for child, then print: parent source bytes: 26 */
+    /* Copy source safely into the bounded buffer. */
+    snprintf(block->message, sizeof(block->message),
+             "%s", source);
+
+    block->ready = 1;
 
     if (waitpid(child_pid, &status, 0) == -1) {
         perror("waitpid");
@@ -166,10 +257,15 @@ int task_capacity_limit(void) {
         return 1;
     }
 
+    printf("parent source bytes: %zu\n", strlen(source));
+
     cleanup_segment(segment_id, block);
+
     return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 1;
 }
 
+
+/* MAIN */
 int main(void) {
     if (task_fast_exchange() != 0) {
         return 1;
@@ -184,5 +280,6 @@ int main(void) {
     }
 
     printf("all tasks done\n");
+
     return 0;
 }
